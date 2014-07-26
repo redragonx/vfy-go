@@ -2,8 +2,8 @@ package main
 
 /*
 * Author: Stephen Chavez
-* WWW: <link here>
-* Date: Jul 28, 2012
+* WWW: dicesoft.net
+* Date: June 30, 2014
 * License: Public domain / Do whatever you want.
 *
 * Backup validator script. Compares two folders "original" and "backup".
@@ -26,6 +26,8 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
+	"math/rand"
 	"github.com/docopt/docopt-go"
 )
 
@@ -83,17 +85,57 @@ func compareRootFolders() {
 
 }
 
-func sameFile(fileA, fileB string) boolean {
+func sameFile(fileA, fileB string) bool {
 
-	// if symlinks, make sure they link to the same thing
-	
-	// both files exist
+	// both files exists
+	fileAOK, fileAErr := doesFileExist(fileA)
+	fileBOK, fileBErr := doesFileExist(fileB)
 
+	if fileAOK != true && fileAErr != nil && fileBOK != true && fileBErr != nil { 
+		return false
+	}
+
+	// both files are the same size
+	fileASize, aSizeErr := getFileSize(fileA)
+	fileBSize, bSizeErr := getFileSize(fileB)
+
+	if aSizeErr != nil && bSizeErr != nil {
+		return false
+	} else if fileASize != fileBSize {
+		return false
+	}
+
+	sampleNumber, convertErr := strconv.Atoi(argOptions["COUNT"].(string))
+
+	// check if the user entered a bad sample number
+	if convertErr != nil {
+		log.Fatal("The -s argument was bad.")
+	}
+
+	same := true;
+
+	// random sample test
+	for i := 0; i < sampleNumber; i++ {
+
+
+	}
 
 
 }
 
-func isSymLink(file string) boolean {
+
+func getFileSize(file string) (int64, error) {
+	
+	fi, err := os.Stat(file) 
+
+	if err != nil {
+		return 0, err
+	}
+
+	return fi.Size(), nil
+}
+func isSymLink(file string) bool {
+	
 	fi, err := os.Lstat(file) 
 
 	if err != nil {
@@ -109,8 +151,8 @@ func isSymLink(file string) boolean {
 
 }
  
-// This function returns true and nil as the returned values, if os.Stat
-// did not return any type of error
+// This function returns true and nil as the returned values, only if the file
+// exists. And the function did not return any type of error.
 // it returns any other error if the error returned by os.Stat is not the
 // expected "does not exist" error.
 func doesFileExist(file string) (bool, error) {
