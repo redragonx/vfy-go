@@ -13,21 +13,26 @@ package main
 * random sample of their contents, and the user is alerted if they differ.
 *
 * Output prefixes:
-* DIR: - Directory in original missing from backup.
-* FILE: - File in original missing from, or different, in backup.
-* SKIP: - Skipping directory specified by --ignore.
-* SYMLINK: - Symlink to directory skipped and not not following (no --follow).
+* DIR - Directory in original missing from backup.
+* FILE - File in original missing from, or different, in backup.
+* SKIP - Skipping directory specified by --ignore.
+* SYMMIS - Symlink mismatch (one is a symlink, one is a regular file, etc.).
+* SYMLINK - Symlink to directory skipped and not not following (no --follow).
 * DIFFS - Not recursing into dir because it is on a different filesystem.
-* ERROR: - Error reading file or directory.
-* DEBUG: - Debug information only shown when called with --verbose.
+* ERROR - Error reading file or directory.
+* DEBUG - Debug information only shown when called with --verbose.
  */
 
 import (
 	"fmt"
 	"log"
 	"os"
+	"io"
+	"bytes"
 	"strconv"
-	"math/rand"
+	"crypto/rand"
+	"math/big"
+	"math"
 	"github.com/docopt/docopt-go"
 )
 
@@ -38,6 +43,7 @@ type resultSummary struct {
 	skippedCount int
 	errorCount   int
 	symLinkError int
+	symMisMatch  int 
 }
 
 func (rs *resultSummary) addDiffCount(num int) {
@@ -56,8 +62,20 @@ func (rs *resultSummary) addErrorCount(num int) {
 	rs.errorCount += num
 }
 
+func (rs *resultSummary) addSymMisMatchCount(num int ) {
+	rs.symLinkError += num
+}
+
+func (rs *resultSummary) addSymLinkError(num int ) {
+	rs.symLinkError += num
+}
+
+// ------------------------------------------------------------------------ //
+
+var sampleSize = 32
 var argOptions map[string]interface{};
-var globalResultSummary resultSummary;
+// setup a resultsummary object to print later
+var globalResultSummary = new(resultSummary)
 
 func compareRootFolders() {
 	// get the stats for these files
@@ -99,9 +117,20 @@ func sameFile(fileA, fileB string) bool {
 	fileASize, aSizeErr := getFileSize(fileA)
 	fileBSize, bSizeErr := getFileSize(fileB)
 
-	if aSizeErr != nil && bSizeErr != nil {
+	if aSizeErr != nil { 
+		fmt.Print("Can't get file size for" + aSizeErr.Error())
+		globalResultSummary.addErrorCount(1)
 		return false
-	} else if fileASize != fileBSize {
+	}
+	
+	if bSizeErr != nil {
+		fmt.Print("Can't get file size for" + bSizeErr.Error())
+		globalResultSummary.addErrorCount(1)
+		return false
+	} 
+	
+	if fileASize != fileBSize {
+		globalResultSummary.addErrorCount(1)
 		return false
 	}
 
@@ -111,16 +140,82 @@ func sameFile(fileA, fileB string) bool {
 	if convertErr != nil {
 		log.Fatal("The -s argument was bad.")
 	}
+	
+	// read both files
+	f1, f1err := os.Open(fileA)
+	f2, f2err := os.Open(fileB)
 
-	same := true;
+	defer f1.Close()
+	defer f2.Close()
 
-	// random sample test
-	for i := 0; i < sampleNumber; i++ {
-
-
+	if f1err != nil {
+		fmt.Print(f1err)
+		globalResultSummary.addErrorCount(1)
+		return false
 	}
 
+	if f2err != nil {
+		fmt.Print(f2err)
+		globalResultSummary.addErrorCount(2)
+		return false
+	}
 
+	same := true
+	
+	// random sample test
+	for i := 0; i < sampleNumber; i++ {
+		startAtByte, randErr := getRandomNumberWithMax(fileASize)
+
+		if randErr != nil {
+			log.Fatal(randErr)
+		}
+		
+		// get a random number of bytes to test...
+		testBytesLength := math.Min(float64(fileASize), (float64(startAtByte) + float64(sampleSize))) - float64(startAtByte) + 1.0
+		
+		aSample := make([]byte, int(testBytesLength))
+		bSample := make([]byte, int(testBytesLength))
+
+		f1ReadByteNum, f1ReadErr := io.ReadAtLeast(f1, aSample, int(testBytesLength))
+		f2ReadByteNum, f2ReadErr := io.ReadAtLeast(f2, bSample, int(testBytesLength))
+
+		// file data is different
+		if f1ReadErr != nil {
+			fmt.Println(f1ReadErr)
+			globalResultSummary.addErrorCount(1)
+			return false
+		}
+		
+		if f2ReadErr != nil {
+			fmt.Println(f2ReadErr)
+			globalResultSummary.addErrorCount(1)
+			return false
+		}
+
+		if (f1ReadByteNum != int(testBytesLength)) && 
+	       (f2ReadByteNum != int(testBytesLength)) {
+			globalResultSummary.addErrorCount(1)
+			return false
+		}
+
+		// check the actual sample data
+		if(bytes.Equal(aSample, bSample)) {
+			return same
+		}
+	} // end of random test  loop
+	return false
+}
+
+func getRandomNumberWithMax(max int64) (int64, error) {
+
+	maxBigInt := big.NewInt(max)
+	i, err := rand.Int(rand.Reader, maxBigInt)
+
+	if err != nil {
+		return 0, err
+	}
+
+	return i.Int64(), nil;
 }
 
 
@@ -134,20 +229,21 @@ func getFileSize(file string) (int64, error) {
 
 	return fi.Size(), nil
 }
-func isSymLink(file string) bool {
+
+func isSymLink(file string) (bool, error) {
 	
 	fi, err := os.Lstat(file) 
 
 	if err != nil {
 		fmt.Println(err)
-		globalResultSummary.addErrorCount(1)
+		return false, err
 	}
 
 	if fi.Mode() & os.ModeSymlink == os.ModeSymlink {
-		return true
+		return true, nil
 	}
 	
-	return false
+	return false, nil
 
 }
  
@@ -223,11 +319,8 @@ Options:
 
 	// end of docopt stuff.
 
-	// setup a resultsummary object to print later
-	globalResultSummary := new(resultSummary)
 
 	compareRootFolders()
 
 	
 }
-
