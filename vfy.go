@@ -46,13 +46,17 @@ type resultSummary struct {
 	errorCount   int
 	symLinkError int
 	symMisMatch  int
+	diffPct 	 string
 }
 
-type dirNotFoundError struct {
-	Dir         string
+func (r *resultSummary) getMachineText() string {
+	return fmt.Sprintf("SUMMARY: items:%i, diff:%i, diffpct:%f64, skip:%i, err:%i ",
+		   r.itemCount, r.diffCount, r.diffPct, r.skippedCount, r.errorCount )
+
 }
 
 
+// The number of bytes to compare during each random sample comparison.
 var sampleSize = 32
 
 // ------------------------------------------------------------------------ //
@@ -72,12 +76,12 @@ var help = flag.BoolP("help", "h", false, "Display this screen")
 // setup a resultsummary object to print later
 var globalResultSummary = new(resultSummary)
 
-func visit(path string, f os.FileInfo, err error) error {
+func visit(relative string)  {
 
 	globalResultSummary.itemCount += 1
 
-	original := path
-	backup := filepath.Join(backupDir, filepath.Base(path))
+	original := filepath.Join(origDir, relative)
+	backup := filepath.Join(backupDir, filepath.Base(relative))
 
 	if *verbose {
 		fmt.Printf("DEBUG: Comparing [%s] to [%s] \n", original, backup)
@@ -89,11 +93,21 @@ func visit(path string, f os.FileInfo, err error) error {
 	folder2Stat, folder2Err := os.Stat(backup)
 
 	if folder1Err != nil {
-		return folder1Err;
+		globalResultSummary.diffCount += 1
+		globalResultSummary.errorCount += 1
+		fmt.Printf("[%s] not a valid folder/file \n", original)
+		fmt.Print(folder1Err);
+
+		return
 	}
 
 	if folder2Err != nil {
-		return folder2Err;
+		globalResultSummary.diffCount += 1
+		globalResultSummary.errorCount += 1
+		fmt.Printf("[%s] not a valid folder/file \n", backup)
+		fmt.Print(folder1Err);
+		
+		return
 	}
 
 	// are both folders here?
@@ -101,57 +115,110 @@ func visit(path string, f os.FileInfo, err error) error {
 		fmt.Printf("DIR [%s] not found in [%s]", original, backup)
 
 		globalResultSummary.diffCount += 1
+		
 		itemCount := countItems(original)
 		globalResultSummary.itemCount += itemCount
 		globalResultSummary.diffCount += itemCount
-		return fmt.Errorf("DirError: This directory could not be read %s in %s", original, backup);
+
+		return
+	}
+
+	files, folderErr := ioutil.ReadDir(original)
+
+	if folderErr != nil {
+		globalResultSummary.errorCount += 1
+		fmt.Print(folderErr)
+		return
 	}
 	
+	for _, item := range files {
+		
+		globalResultSummary.itemCount += 1
 
-	// if both folders are here.
+		origPath := filepath.Join(original, item.Name())
+		backupPath := filepath.Join(backup, item.Name())
+		
+		// This check is independent of whether or not the path is a directory or
+		// a file. If either is a symlink, make sure they are both symlinks, and
+		// that they link to the same thing.
 
-	// This check is independent of whether or not the path is a directory or
-	// a file. If either is a symlink, make sure they are both symlinks, and
-	// that they link to the same thing.
+		if isSymLink(origPath) || isSymLink(backupPath) {
+			if isSymLink(origPath) && isSymLink(backupPath) {
 
-	if isSymLink(original) || isSymLink(backup) {
-		if isSymLink(original) && isSymLink(backup) {
+				symlink1, symErr1 := filepath.EvalSymlinks(origPath);
+				symlink2, symErr2 := filepath.EvalSymlinks(backupPath);
 
-			symlink1, symErr1 = filepath.EvalSymlinks(original);
-			symlink2, symErr2 = filepath.EvalSymnlinks(backup);
+				if symErr1 != nil || symErr2 != nil {			
+					fmt.Printf("SYMMIS: Syslink read error [%s]", origPath)
+				}
 
-			if symErr1 || symErr2 != nil {			
-				return fmt.Errorf("SYMMIS: Syslink match [%s] and [%s]", original, backup)
+				// SYMLINK MISMATCH
+				if symlink1 != symlink2 {
+					fmt.Printf("SYMMIS: Syslink mismatch [%s] and [%s]", origPath, backupPath)
+
+
+					// Count the missing file or directory.
+					globalResultSummary.diffCount += 1
+
+					// If the orignal symlink was a directory, then the backup
+					// is missing that directory, PLUS all of that directory's
+					// contents.
+					if item.IsDir() {
+						itemCount := countItems(origPath)
+						globalResultSummary.itemCount += itemCount
+						globalResultSummary.diffCount += itemCount
+					}
+						return
+				}
+
 			}
+		}
 
-			if symlink1 != symlink2 {
+		if isDirOrFile(folder1Stat) == "directory" {
+				
+			if !*followSymlinks {
+				globalResultSummary.skippedCount += 1
+				fmt.Printf("SYMLINK: [%s] skipped", origPath)
 
+				return
+			}
+			// Stay on one filesystem if told to do so...
+
+			outerDevStat, outerDevStatErr := os.Stat(original)
+			innerDevStat, innerDevStatErr := os.Stat(origPath)
+
+			if outerDevStatErr != nil {
+				globalResultSummary.skippedCount += 1
+				fmt.Print(outerDevStatErr)
+				return
 			}
 			
-			fmt.Printf("SYMMIS: Syslink match [%s] and [%s]", original, backup)
+			if innerDevStatErr != nil {
+				globalResultSummary.skippedCount += 1
+				fmt.Print(innerDevStatErr)
+				return
+			}
 
+			outerDev := outerDevStat.Sys().(*syscall.Stat_t).Dev
+			innerDev := innerDevStat.Sys().(*syscall.Stat_t).Dev
 
-		}
+			if outerDev != innerDev && *oneFilesystem {
+				globalResultSummary.skippedCount += 1
+				fmt.Printf("DIFFERS: [%s] is on a different file system. Skipped", origPath)
+				return
+			}
+			visit(filepath.Join(relative, item.Name()))
+		} else {
+			if !sameFile(original, backup) {
+				globalResultSummary.diffCount += 1;
+				fmt.Printf( "FILE: [%s] not found at, or doesn't match [%s]", origPath, backupPath)
+			}
+		} // end for loop
 	}
-	stat, err := os.Stat("/etc")
-	if err != nil {
-		log.Fatal(err)
-	}
-	dev := stat.Sys().(*syscall.Stat_t).Dev
-
-
-	if(sameFile(original, backup)) {
-		globalResultSummary.itemCount += 1;
-	}
-
-	return nil
 }
 
-func compareDirs(relative string) {
-	err := filepath.Walk(relative, visit)
-
-
-	fmt.Printf("filepath.Walk() returned %v\n", err)
+func compare(relative string) {
+	visit(relative)
 }
 
 func sameFile(fileA, fileB string) bool {
@@ -360,6 +427,13 @@ func countItems(dir string) int {
 //         }	
 // }
 
+func printSummary() {
+	globalResultSummary.diffPct = fmt.Sprintf("%.f", (float64(globalResultSummary.diffCount) / float64(globalResultSummary.itemCount) * 100));
+
+	if *machine {
+		fmt.Print(globalResultSummary.getMachineText);
+	}
+}
 
 func main() {
 usage := `Backup verify script.
@@ -419,6 +493,7 @@ Options:
 		log.Fatalf("%s is not a directory.", origDir)
 	}
 
-	compareDirs(origDir)
+	compare("")
+	printSummary();
 
 }
