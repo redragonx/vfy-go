@@ -7,10 +7,11 @@ Abstract:
 For my own benefit, I ported @defuse's [backup verifier
 script](https://github.com/defuse/backup-verify) to Go. The lang from Google
 
-See my [blog post](https://dicesoft.net/blog/go-backup-program.html) for my thoughts on making this. 
+See my [blog post](https://dicesoft.net/blog/go-backup-program.html) for my thoughts on making this.
 
 Description of the program:
 ----------------------------
+```
 Backup verify script.
 
 Usage:
@@ -28,7 +29,7 @@ Options:
   -x, --one-filesystem             Stay on one file system (in <original>)
   -s, --samples COUNT              Comparison sample count [default: 0]
   -h, --help                       Display this screen
-
+```
 
 How to install on your system
 -----------------------------
