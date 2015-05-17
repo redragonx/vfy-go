@@ -11,6 +11,8 @@ package main
 * "backup" (extra files in "backup" are ignored). If a file exists in both
 * "original" and "backup," they are compared by checking their lengths and by a
 * random sample of their contents, and the user is alerted if they differ.
+* 
+* Code based on https://github.com/defuse/backup-verify 
 *
 * Output prefixes:
 * DIR - Directory in original missing from backup.
@@ -27,6 +29,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"io"
 	"io/ioutil"
 	"path/filepath"
@@ -49,39 +52,47 @@ type resultSummary struct {
 	diffPct 	 string
 }
 
-func (r *resultSummary) getMachineText() string {
-	return fmt.Sprintf("SUMMARY: items:%i, diff:%i, diffpct:%f64, skip:%i, err:%i ",
-		   r.itemCount, r.diffCount, r.diffPct, r.skippedCount, r.errorCount )
 
+func (r *resultSummary) getMachineText() string {
+	return fmt.Sprintf("SUMMARY: items: %d, diff:%d, diffpct:%s skip:%d, err:%d, symErr:%d, symMisMatchErr:%d ",
+		   r.itemCount, r.diffCount, r.diffPct, r.skippedCount, r.errorCount, r.symLinkError, r.symMisMatch )
+
+}
+
+func (r *resultSummary) getHumanReadableText() string {
+	similarities := r.itemCount - r.diffCount
+
+	return fmt.Sprintf("\nSUMMARY: \n\t Items processed: %d \n\t Differences: %d (%s%%) \n\t Similarities: %d \n\t Skipped: %d \n\t Errors: %d \n\t Symlink Errors: %d \n\t SymMisMatch Errors: %d \n",
+		   r.itemCount, r.diffCount, r.diffPct, similarities, r.skippedCount, r.errorCount, r.symLinkError, r.symMisMatch )
 }
 
 
 // The number of bytes to compare during each random sample comparison.
 var sampleSize = 32
 
+var userSource1 = ""
+var userSource2 = ""
+
+
+// setup a resultsummary object to print later
+var globalResultSummary = new(resultSummary)
+
 // ------------------------------------------------------------------------ //
-var origDir = ""
-var backupDir = ""
 
 var verbose = flag.BoolP("verbose", "v", false, "Print what is being done")
 var machine = flag.BoolP("machine", "m", false, "Output summary in machine-readable format")
-var followSymlinks = flag.BoolP("follow", "f", false, "Follow symlinks")
 var oneFilesystem = flag.BoolP("one-filesystem", "x", false, "Stay on one filesystem (in <original>)")
-var ignoreDir = flag.StringP("ignore", "i", "", "Don't process DIR")
 var sampleCount = flag.Int64P("samples", "s", 0, "Comparison sample count [default: 0]")
 var help = flag.BoolP("help", "h", false, "Display this screen")
 
 // ------------------------------------------------------------------------ //
 
-// setup a resultsummary object to print later
-var globalResultSummary = new(resultSummary)
 
 func visit(relative string)  {
 
-	globalResultSummary.itemCount += 1
 
-	original := filepath.Join(origDir, relative)
-	backup := filepath.Join(backupDir, filepath.Base(relative))
+	original := filepath.Join(userSource1, relative)
+	backup := filepath.Join(userSource2, relative)
 
 	if *verbose {
 		fmt.Printf("DEBUG: Comparing [%s] to [%s] \n", original, backup)
@@ -89,136 +100,179 @@ func visit(relative string)  {
 
 //	if *ignoreDir != original || 
 	// Make sure both directories exist
-	folder1Stat, folder1Err := os.Stat(original)
-	folder2Stat, folder2Err := os.Stat(backup)
+	file1Stat, file1Err := os.Stat(original)
+	file2Stat, file2Err := os.Stat(backup)
 
-	if folder1Err != nil {
+	if file1Err != nil {
 		globalResultSummary.diffCount += 1
 		globalResultSummary.errorCount += 1
 		fmt.Printf("[%s] not a valid folder/file \n", original)
-		fmt.Print(folder1Err);
 
-		return
-	}
-
-	if folder2Err != nil {
-		globalResultSummary.diffCount += 1
-		globalResultSummary.errorCount += 1
-		fmt.Printf("[%s] not a valid folder/file \n", backup)
-		fmt.Print(folder1Err);
-		
-		return
-	}
-
-	// are both folders here?
-	if !(isDirOrFile(folder1Stat) == "directory" && isDirOrFile(folder2Stat) == "directory") {
-		fmt.Printf("DIR [%s] not found in [%s]", original, backup)
-
-		globalResultSummary.diffCount += 1
-		
-		itemCount := countItems(original)
-		globalResultSummary.itemCount += itemCount
-		globalResultSummary.diffCount += itemCount
-
-		return
-	}
-
-	files, folderErr := ioutil.ReadDir(original)
-
-	if folderErr != nil {
-		globalResultSummary.errorCount += 1
-		fmt.Print(folderErr)
 		return
 	}
 	
-	for _, item := range files {
-		
-		globalResultSummary.itemCount += 1
+	if file2Err != nil {
+		globalResultSummary.diffCount += 1
+		globalResultSummary.errorCount += 1
+		fmt.Printf("[%s] not a valid folder/file \n", backup)
 
-		origPath := filepath.Join(original, item.Name())
-		backupPath := filepath.Join(backup, item.Name())
-		
-		// This check is independent of whether or not the path is a directory or
-		// a file. If either is a symlink, make sure they are both symlinks, and
-		// that they link to the same thing.
+		return
+	}
+	
+	// Stay on one filesystem if told to do so...
 
-		if isSymLink(origPath) || isSymLink(backupPath) {
-			if isSymLink(origPath) && isSymLink(backupPath) {
+	
 
-				symlink1, symErr1 := filepath.EvalSymlinks(origPath);
-				symlink2, symErr2 := filepath.EvalSymlinks(backupPath);
-
-				if symErr1 != nil || symErr2 != nil {			
-					fmt.Printf("SYMMIS: Syslink read error [%s]", origPath)
-				}
-
-				// SYMLINK MISMATCH
-				if symlink1 != symlink2 {
-					fmt.Printf("SYMMIS: Syslink mismatch [%s] and [%s]", origPath, backupPath)
-
-
-					// Count the missing file or directory.
-					globalResultSummary.diffCount += 1
-
-					// If the orignal symlink was a directory, then the backup
-					// is missing that directory, PLUS all of that directory's
-					// contents.
-					if item.IsDir() {
-						itemCount := countItems(origPath)
-						globalResultSummary.itemCount += itemCount
-						globalResultSummary.diffCount += itemCount
-					}
-						return
-				}
-
-			}
+	// are both folders here?
+	if isDirOrFile(file1Stat) == "directory" {
+		if *verbose {
+			fmt.Print("\n In folder checking code\n\n")
 		}
 
-		if isDirOrFile(folder1Stat) == "directory" {
-				
-			if !*followSymlinks {
-				globalResultSummary.skippedCount += 1
-				fmt.Printf("SYMLINK: [%s] skipped", origPath)
+		if isDirOrFile(file2Stat) != "directory"  {
+		fmt.Print(file2Err.Error())
 
-				return
-			}
-			// Stay on one filesystem if told to do so...
+		if *verbose {
+			fmt.Print("\n In folder checking code: SECOND IF STATEMENT")
+			fmt.Printf("DIR [%s] not found in [%s]", original, backup)
+		}
 
-			outerDevStat, outerDevStatErr := os.Stat(original)
-			innerDevStat, innerDevStatErr := os.Stat(origPath)
+			globalResultSummary.diffCount += 1
+			
+			itemCount := countItems(original)
+			globalResultSummary.itemCount += itemCount
+			globalResultSummary.diffCount += itemCount
 
-			if outerDevStatErr != nil {
-				globalResultSummary.skippedCount += 1
-				fmt.Print(outerDevStatErr)
-				return
+			return
+		}
+
+		
+		// Read child folder's contents
+		files, folderReadErr := ioutil.ReadDir(original)
+		
+		if folderReadErr != nil {
+			globalResultSummary.diffCount += 1
+			globalResultSummary.errorCount += 1
+			fmt.Printf("Cannot read folder contents: [%s]  \n", original)
+
+			return
+		}
+
+		for _, item := range files {
+
+			if item.Name() == "." || item.Name() == ".." {
+				continue;
 			}
 			
-			if innerDevStatErr != nil {
-				globalResultSummary.skippedCount += 1
-				fmt.Print(innerDevStatErr)
-				return
+			globalResultSummary.itemCount += 1
+
+			origChildItemPath := filepath.Join(original, item.Name())
+			backupChildItemPath := filepath.Join(backup, item.Name())
+			
+			
+			// This check is independent of whether or not the path is
+			// a directory or a file. If either is a symlink, make sure they are
+			// both symlinks, and that they link to the same thing.
+
+			if isSymLink(origChildItemPath) || isSymLink(backupChildItemPath) {
+				if isSymLink(origChildItemPath) &&
+					isSymLink(backupChildItemPath) {
+
+					symlink1, symErr1 := filepath.EvalSymlinks(origChildItemPath);
+					symlink2, symErr2 := filepath.EvalSymlinks(backupChildItemPath);
+
+					if symErr1 != nil {			
+						fmt.Printf("SYMMIS: Syslink read error [%s] \n",
+						origChildItemPath)
+						
+						globalResultSummary.symLinkError += 1
+						return
+					}
+					
+					if symErr2 != nil {			
+						fmt.Printf("SYMMIS: Syslink read error [%s] \n",
+						backupChildItemPath)
+
+						globalResultSummary.symLinkError += 1
+						return
+					}
+
+					// SYMLINK MISMATCH
+					if symlink1 != symlink2 {
+						fmt.Printf("SYMMIS: Syslink mismatch [%s] and [%s] \n",
+							origChildItemPath,
+							backupChildItemPath)
+
+
+						// Count the missing file or directory.
+						globalResultSummary.diffCount += 1
+						globalResultSummary.symMisMatch += 1
+
+						// If the orignal symlink was a directory, then the 
+						// backup is missing that directory, PLUS all of that 
+						// directory's contents.
+
+						if file1Stat.IsDir() {
+							itemCount := countItems(origChildItemPath)
+							globalResultSummary.itemCount += itemCount
+							globalResultSummary.diffCount += itemCount
+						}
+						return
+					}
+				}
 			}
 
-			outerDev := outerDevStat.Sys().(*syscall.Stat_t).Dev
-			innerDev := innerDevStat.Sys().(*syscall.Stat_t).Dev
-
-			if outerDev != innerDev && *oneFilesystem {
-				globalResultSummary.skippedCount += 1
-				fmt.Printf("DIFFERS: [%s] is on a different file system. Skipped", origPath)
-				return
-			}
-			visit(filepath.Join(relative, item.Name()))
-		} else {
-			if !sameFile(original, backup) {
-				globalResultSummary.diffCount += 1;
-				fmt.Printf( "FILE: [%s] not found at, or doesn't match [%s]", origPath, backupPath)
+			
+			if item.IsDir() {
+					
+			checkFileSystem(userSource1, origChildItemPath);
+			
+			visit(filepath.Join( relative, item.Name()))
+			} else {
+				if !sameFile(origChildItemPath, backupChildItemPath) {
+					globalResultSummary.diffCount += 1;
+					fmt.Printf( "FILE: [%s] not found at," +
+						"or doesn't match [%s] \n", origChildItemPath,
+						backupChildItemPath)
+				}
 			}
 		} // end for loop
 	}
+
 }
 
 func compare(relative string) {
 	visit(relative)
+}
+
+func checkFileSystem(fileA, fileB string) {
+
+	outerDevStat, outerDevStatErr := os.Stat(fileA)
+	innerDevStat, innerDevStatErr := os.Stat(fileB)
+
+	if outerDevStatErr != nil {
+		globalResultSummary.skippedCount += 1
+		fmt.Print(outerDevStatErr)
+		return
+	}
+	
+	if innerDevStatErr != nil {
+		globalResultSummary.skippedCount += 1
+		fmt.Print(innerDevStatErr)
+		return
+	}
+
+	outerDev := outerDevStat.Sys().(*syscall.Stat_t).Dev
+	innerDev := innerDevStat.Sys().(*syscall.Stat_t).Dev
+
+	if outerDev != innerDev && *oneFilesystem {
+		globalResultSummary.skippedCount += 1
+		fmt.Printf("DIFFERS: [%s] is on a different file system than [%s]." +
+			"Skipped \n",
+			fileA,
+			fileB)
+		return
+	}
 }
 
 func sameFile(fileA, fileB string) bool {
@@ -227,7 +281,11 @@ func sameFile(fileA, fileB string) bool {
 	fileAOK, fileAErr := doesFileExist(fileA)
 	fileBOK, fileBErr := doesFileExist(fileB)
 
-	if fileAOK != true && fileAErr != nil && fileBOK != true && fileBErr != nil { 
+	if fileAOK != true &&
+		fileAErr != nil &&
+		fileBOK != true &&
+		fileBErr != nil {
+	
 		globalResultSummary.errorCount += 1
 		return false
 	}
@@ -237,13 +295,13 @@ func sameFile(fileA, fileB string) bool {
 	fileBSize, bSizeErr := getFileSize(fileB)
 
 	if aSizeErr != nil {
-		fmt.Print("Can't get file size for" + aSizeErr.Error())
+		fmt.Print("Can't get file size for" + aSizeErr.Error() + "\n")
 		globalResultSummary.errorCount += 1
 		return false
 	}
 	
 	if bSizeErr != nil {
-		fmt.Print("Can't get file size for" + bSizeErr.Error())
+		fmt.Print("Can't get file size for" + bSizeErr.Error() + "\n")
 		globalResultSummary.errorCount += 1
 		return false
 	}
@@ -283,13 +341,20 @@ func sameFile(fileA, fileB string) bool {
 		}
 		
 		// get a random number of bytes to test...
-		testBytesLength := math.Min(float64(fileASize), (float64(startAtByte) + float64(sampleSize))) - float64(startAtByte) + 1.0
+		testBytesLength := math.Min(float64(fileASize),
+			(float64(startAtByte) + float64(sampleSize))) -
+									float64(startAtByte) + 1.0
 		
 		aSample := make([]byte, int(testBytesLength))
 		bSample := make([]byte, int(testBytesLength))
 
-		f1ReadByteNum, f1ReadErr := io.ReadAtLeast(f1, aSample, int(testBytesLength))
-		f2ReadByteNum, f2ReadErr := io.ReadAtLeast(f2, bSample, int(testBytesLength))
+		f1ReadByteNum, f1ReadErr := io.ReadAtLeast(f1,
+			aSample,
+			int(testBytesLength))
+
+		f2ReadByteNum, f2ReadErr := io.ReadAtLeast(f2,
+			bSample,
+			int(testBytesLength))
 
 		// file data is different
 		if f1ReadErr != nil {
@@ -317,7 +382,7 @@ func sameFile(fileA, fileB string) bool {
 	} else {
 			return false
 		}
-	} // end of random test  loop
+	} // end of random test loop
 	return same
 }
 
@@ -345,8 +410,12 @@ func getFileSize(file string) (int64, error) {
 }
 
 func isSymLink(file string) (bool) {
-	
+
 	fi, err := os.Lstat(file)
+
+	if *verbose {
+		fmt.Print( "\nin isSymlink" + file + "\n")
+	}
 
 	if err != nil {
 		fmt.Println(err)
@@ -360,6 +429,7 @@ func isSymLink(file string) (bool) {
 	return false
 
 }
+
 
 // This function returns true and nil as the returned values, only if the file
 // exists. And the function did not return any type of error.
@@ -401,7 +471,10 @@ func countItems(dir string) int {
 	dirItems, folderErr := ioutil.ReadDir(dir)
 
 	if folderErr != nil {
-		fmt.Printf("Unable to read %s, the error was %s", dir, folderErr.Error())
+		fmt.Printf("Unable to read %s, the error was %s",
+		dir,
+		folderErr.Error() +"\n")
+		
 		globalResultSummary.errorCount += 1
 	}
 
@@ -416,22 +489,15 @@ func countItems(dir string) int {
 	return count
 }
 
-// func trapSignals(chan signalChannel) {
-// 	
-// 	sig := <-signalChannel
-//         switch sig {
-//         case os.Interrupt:
-//             //handle SIGINT
-//        // case syscall.SIGTERM:
-//             //handle SIGTERM
-//         }	
-// }
-
 func printSummary() {
-	globalResultSummary.diffPct = fmt.Sprintf("%.f", (float64(globalResultSummary.diffCount) / float64(globalResultSummary.itemCount) * 100));
+	globalResultSummary.diffPct = fmt.Sprintf("%.f",
+		(float64(globalResultSummary.diffCount) /
+		float64(globalResultSummary.itemCount) * 100));
 
 	if *machine {
-		fmt.Print(globalResultSummary.getMachineText);
+		fmt.Print(globalResultSummary.getMachineText());
+	} else {
+		fmt.Print(globalResultSummary.getHumanReadableText())
 	}
 }
 
@@ -450,50 +516,53 @@ used to easily determine if a backup is valid and recent.
 Options:
   -v, --verbose                    Print what is being done
   -m, --machine                    Output summary in machine-readable format
-  -f, --[no-]follow                Follow symlinks
   -x, --one-filesystem             Stay on one file system (in <original>)
-  -c, --count                      Count files in unmatched directories
-  -i, --ignore DIR                 Don't process DIR
   -s, --samples COUNT              Comparison sample count [default: 0]
   -h, --help                       Display this screen`
+
 
 	flag.Parse()
 	
 	if *help {
 		fmt.Print(usage)
+		fmt.Println();
 		os.Exit(1)
 	}
 
 	cmdLineStuff := flag.Args()
-
+	
 	if len(cmdLineStuff) < 2 {
 		log.Fatal("You must specify original and backup folders.")
 	}
+	
+	sig := make(chan os.Signal, 1)
+    signal.Notify(sig, os.Interrupt, os.Kill)
 
-	origDir = cmdLineStuff[0]
-	backupDir = cmdLineStuff[1]
+	userSource1 = cmdLineStuff[0]
+	userSource2 = cmdLineStuff[1]
 
 	// Does these locations exist?
-	origDirStats, statErr := os.Stat(origDir)
-	backupDirStats, statErr2 := os.Stat(backupDir)
+	origDirStats, statErr := os.Stat(userSource1)
+	backupDirStats, statErr2 := os.Stat(userSource2)
 	
 	if(statErr != nil) {
-		log.Fatalf("%s cannot be read", origDir)
+		log.Fatalf("%s cannot be read", userSource1)
 	}
 	
 	if(statErr2 != nil) {
-		log.Fatalf("%s cannot be read", backupDir)
+		log.Fatalf("%s cannot be read", userSource2)
 	}
 
 	if isDirOrFile(origDirStats) != "directory" {
-		log.Fatalf("%s is not a directory.", origDir)
+		log.Fatalf("%s is not a directory.", userSource1)
 	}
 	
 	if isDirOrFile(backupDirStats) != "directory" {
-		log.Fatalf("%s is not a directory.", origDir)
+		log.Fatalf("%s is not a directory.", userSource2)
 	}
 
-	compare("")
-	printSummary();
+
+	 compare("")
+	 printSummary();
 
 }
