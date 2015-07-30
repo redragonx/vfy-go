@@ -35,6 +35,6 @@ How to install on your system
 -----------------------------
 
 1. Setup Go, you can read how [here](https://golang.org/doc/install)
-2. run `go get https://github.com/redragonx/vfy-go`
+2. run `go get github.com/redragonx/vfy-go`
 3. cd into the src dir and run `go install`
 4. If done properly, you can run the program anywhere.
